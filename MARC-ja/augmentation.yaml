@@ -1,4 +1,4 @@
-﻿# データ増強ジョブ全体の設定
+# データ増強ジョブ全体の設定
 augmentation:
   dataset:
     # 増強に利用する元データの場所と列情報
@@ -20,10 +20,11 @@ augmentation:
     # 4bit 量子化を試す場合は下記のコメントアウトを解除して利用してください。
     # 量子化指定例（GPU が対応していないと NaN が発生するため注意）:
     quantization: "4bit"
-    bnb_4bit_use_double_quant: false
+    bnb_4bit_use_double_quant: true  
     bnb_4bit_quant_type: "nf4"
-    quantization_compute_dtype: float16
-    
+    quantization_compute_dtype: bfloat16
+    torch_dtype: bfloat16
+
     tokenizer:
       use_fast: true
 
