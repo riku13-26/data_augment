@@ -1,0 +1,62 @@
+﻿# モデル全体の設定
+model:
+  name: "tohoku-nlp/bert-base-japanese-v3"         # ベースとなる事前学習モデル
+  max_len: 512                                    # 入力トークンの最大長
+  num_labels: 2                                   # 分類ラベル数（MARC-jaは2値）
+  tokenizer:
+    use_fast: true                                # FastTokenizer を優先的に使用
+    fallback_to_basic_if_unavailable: true        # fugashi 等が無い場合に基本Tokenizerへフォールバック
+
+# 学習時のハイパーパラメータ
+training:
+  output_dir: "outputs/bert-marcja"               # 学習済みモデルやログの出力先
+  lr: 2e-5                                        # 学習率
+  epochs: 3                                     # エポック数
+  train_bs: 32                                    # バッチサイズ（学習）
+  eval_bs: 64                                     # バッチサイズ（評価）
+  weight_decay: 0.01                              # L2正則化係数
+  warmup_ratio: 0.06                              # ウォームアップ比率
+  gradient_accumulation_steps: 1                  # 勾配累積のステップ数
+  save_total_limit: 2                             # 保存モデル数の上限
+  logging_steps: 50                               # ログを表示するステップ間隔
+  eval_strategy: "steps"                         # 評価タイミング（steps / epoch / no）
+  save_strategy: "steps"                         # モデル保存タイミング
+  report_to: "wandb"                             # ロギング先（none / wandb / tensorboard）
+  seed: 42                                        # 学習時の乱数シード
+  fp16: false                                     # FP16 混合精度の使用可否
+  bf16: true                                      # BF16 混合精度の使用可否
+  lr_scheduler_type: "cosine"                    # 学習率スケジューラ
+  disable_tqdm: true                              # 進捗バーの抑制（True 推奨）
+  log_level: "error"                             # Transformers ロガーの表示レベル
+  log_level_replica: "error"                     # マルチGPU実行時の表示レベル
+
+# データに関する設定
+# サブセットを事前に make_sampling_data.py で生成し、train_subset_enabled を true にすると
+# そのサブセットのみを学習に利用します。
+data:
+  train_subset_ratio: 0.01  # make_sampling_data.py でサブセットを再生成する際の比率
+  train_subset_seed: 42     # make_sampling_data.py で使用するシャッフルシード
+  train_subset_path: "data/marc_ja_train_subset.jsonl"  # サブセットの保存先パス
+  train_subset_enabled: false   # true: 保存済みサブセットを利用 / false: データセット全体を使用
+
+  # 拡張データを元データと混ぜて学習するための設定
+  augmented_mix:
+    enabled: false                                 # true: 合成データを混ぜて学習
+    original_fraction: 1                         # 元データの利用割合 (0~1)
+    augmented_paths:
+      - "data/marc_ja_augmented_ja_to_en_run1_en_to_ja.jsonl"     # ゼロショット/ヒューショットなど生成データのパス
+      - "data/marc_ja_augmented_ja_to_en_run2_en_to_ja.jsonl"
+      - "data/marc_ja_augmented_ja_to_en_run3_en_to_ja.jsonl"
+      - "data/marc_ja_augmented_ja_to_en_run4_en_to_ja.jsonl"
+      - "data/marc_ja_augmented_ja_to_en_run5_en_to_ja.jsonl"
+    seed: 42                                       # 元データをサンプリングするときのシード
+    shuffle_after_concat: true                     # 結合後にシャッフルするか
+
+# Weights & Biases のラン設定
+wandb:
+  project: "marc-ja"                              # プロジェクト名
+  entity: null                                     # チーム / ユーザー名（不要なら null）
+  run_name: tohoku_bert_full                      # ラン名
+  tags: []                                        # タグ
+  notes: ""                                      # 任意のメモ
+  watch_model: false                              # モデル監視機能をオンにするか
