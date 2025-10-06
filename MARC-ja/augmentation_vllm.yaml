@@ -1,0 +1,175 @@
+# vLLM を用いた非同期データ増強ジョブ設定
+augmentation:
+  dataset:
+    input_path: "data/marc_ja_train_subset.jsonl"
+    text_column: "sentence"
+    label_column: "label"
+    label_names:
+      - positive
+      - negative
+    default_output_prefix: "data/marc_ja_augmented"
+
+  model:
+    provider: "vllm"                 # vLLM エンジンを利用 (huggingface/unsloth ではない)
+    name: "google/gemma-3-4b-it"      # 推論に使うベースモデル。engine_args.model が未指定ならここを参照
+    tokenizer: "google/gemma-3-4b-it" # tokenizer を個別指定したい場合に利用。未指定なら name と同一
+    chat_template: "gemma-3"          # vLLM の chat template 名。未指定時は infer_chat_template_name で自動推定
+    engine_args:
+      tensor_parallel_size: 1         # GPU を複数枚使う場合は並列数を増やす。1 なら単一 GPU
+      dtype: "bfloat16"               # vLLM でモデルをロードする際の dtype
+      gpu_memory_utilization: 0.90    # GPU メモリ使用率の上限。高すぎると OOM しやすいので環境に応じて調整
+      trust_remote_code: true         # モデルが独自コードを要求する場合 true。安全性に留意
+      tokenizer_pool_size: 2          # トークナイズを並列処理するワーカー数。CPU と相談して調整
+      tokenizer_mode: "auto"          # fast/slow を自動選択。特殊トークナイザを強制する場合は明示的に設定
+      max_model_len: 8192             # 1 リクエストあたりの入力+出力トークン長の上限 (vLLM 側)
+      enable_chunked_prefill: true    # 長文入力時にプリフィルを分割し、メモリ消費の急増を抑える
+      max_num_batched_tokens: 32768   # 1 バッチ内の総トークン数上限。大きいほどスループット↑だが VRAM↑
+      max_num_seqs: 256               # 同時に処理するシーケンス数の上限。並列度とメモリをトレードオフ
+      block_size: 16                  # KV キャッシュ分割サイズ。小さすぎるとオーバーヘッド増、大きすぎると断片化
+      enable_prefix_caching: true     # 同一プロンプトの共通部分を再利用してプリフィルを高速化
+      enforce_eager: false            # True にすると torch.compile を無効化し安定性優先 (速度↓)
+      # kv_cache_memory: 3740594176   # ログ推奨値を反映する場合に有効化
+    request_options:
+      max_concurrent_requests: 4      # AsyncLLMEngine で同時に流すリクエスト数の上限
+      poll_interval: 0.02             # 推論完了チェックのポーリング間隔 (秒)
+
+  # === GPUメモリ別プリセット例 ===
+  # 必要に応じて下記の値で model / generation_defaults / request_options を上書きしてください
+  presets:
+    gpu_16gb:
+      description: "単一GPU (16GB) 想定の軽量設定"
+      model:
+        engine_args:
+          tensor_parallel_size: 1
+          gpu_memory_utilization: 0.85    # 余裕を持たせて OOM 回避
+          max_model_len: 4096             # 長文は抑えめに
+          max_num_batched_tokens: 12288   # 16GB ではこの辺りが安定ライン
+          max_num_seqs: 96                # 並列投入数も控えめに
+          block_size: 16
+          enable_chunked_prefill: true
+          enable_prefix_caching: true
+      generation_defaults:
+        batch_size: 3                     # VRAM に合わせてバッチを縮小
+        max_new_tokens: 384               # 出力長も少し短く
+
+    gpu_24gb:
+      description: "単一GPU (24GB) 用のバランス設定"
+      model:
+        engine_args:
+          tensor_parallel_size: 1
+          gpu_memory_utilization: 0.90
+          max_model_len: 6144
+          max_num_batched_tokens: 20480   # より大きなバッチが許容可能
+          max_num_seqs: 160
+          block_size: 16
+          enable_chunked_prefill: true
+          enable_prefix_caching: true
+      generation_defaults:
+        batch_size: 5                     # デフォルトより少し抑えめ
+        max_new_tokens: 512
+
+    gpu_24gb_x2:
+      description: "2枚の24GB GPU (TP=2) を想定した高スループット設定"
+      model:
+        engine_args:
+          tensor_parallel_size: 2         # GPU2枚でテンソル並列
+          gpu_memory_utilization: 0.92    # 余裕を見つつ高めに設定
+          max_model_len: 8192             # 長文入力も許容
+          max_num_batched_tokens: 40960   # 2枚構成でバッチを増やす
+          max_num_seqs: 256
+          block_size: 32                  # 大きめブロックでキャッシュ効率改善
+          enable_chunked_prefill: true
+          enable_prefix_caching: true
+      request_options:
+        max_concurrent_requests: 6        # 並列リクエストを増やす
+      generation_defaults:
+        batch_size: 8                     # GPU2枚でバッチも拡大
+        max_new_tokens: 640               # 生成長に余裕
+
+  generation_defaults:
+    max_new_tokens: 512               # 生成する最大新規トークン数
+    temperature: 1.0                  # サンプリング温度。1.0 付近で自然、値を下げると保守的
+    top_p: 0.95                       # nucleus sampling の確率質量。小さくすると多様性が減る
+    top_k: 64                         # top-k サンプリング上限。多様性と品質のバランスを調整
+    repetition_penalty: 1.0           # 繰り返し抑制係数。>1.0 で重複を抑える
+    do_sample: true                   # true で確率的サンプリング、false で貪欲法 (deterministic)
+    num_generations_per_sample: 1     # 1 レコードから生成するバリエーション数
+    batch_size: 6                     # 1 回の flush でまとめて送るプロンプト数。GPU メモリに合わせて調整
+    seed: 42                          # 乱数シード。None にすると毎回ランダム
+
+  prompts:
+    zero_shot:
+      description: "zeroshot生成"
+      generation_multiplier: 5.0
+      output_path_template: "data/marc_ja_augmented_zero_shot_run{run_index}.jsonl"
+      system_prompt: ""
+      user_prompt_template: |-
+        あなたは日本語レビューを作成するアシスタントです。以下の条件を守り、指定された感情ラベルに合う自然なレビュー文を1件出力してください。
+
+        感情ラベル:
+        {label_name}
+
+        制約:
+        - 感情ラベルに一致するトーンと内容にすること
+        - レビュー以外の説明や考察、ラベルの再掲はしないこと
+
+        出力:
+
+    few_shot:
+      description: "rewrite生成"
+      generation_multiplier: 5.0
+      output_path_template: "data/marc_ja_augmented_few_shot_run{run_index}.jsonl"
+      system_prompt: ""
+      user_prompt_template: |-
+        あなたは日本語レビューを改善するアシスタントです。参考として与えられたレビューと同じ感情ラベルを維持しつつ、レビューを書き換えてください。レビュー以外の説明文は不要です。
+
+        参考レビュー:
+        {input_text}
+
+        感情ラベル:
+        {label_name}
+
+        出力:
+
+    ja_to_en_translation:
+      description: "日本語レビューを英語に翻訳"
+      generation_multiplier: 5.0
+      generation:
+        num_generations_per_sample: 1
+      output_path_template: "data/marc_ja_augmented_ja_to_en_run{run_index}.jsonl"
+      system_prompt: ""
+      user_prompt_template: |-
+        You are a professional Japanese-to-English translator. Translate the following Japanese review into natural English that reflects the requested sentiment label. Output only the translated review text.
+
+        Japanese review:
+        {input_text}
+
+        Sentiment label:
+        {label_name}
+
+        Response:
+
+    en_to_ja_translation:
+      description: "英語レビューを日本語に翻訳"
+      dataset:
+        input_paths:
+          - "data/marc_ja_augmented_ja_to_en_run1.jsonl"
+          - "data/marc_ja_augmented_ja_to_en_run2.jsonl"
+          - "data/marc_ja_augmented_ja_to_en_run3.jsonl"
+          - "data/marc_ja_augmented_ja_to_en_run4.jsonl"
+          - "data/marc_ja_augmented_ja_to_en_run5.jsonl"
+      generation_multiplier: 1.0
+      generation:
+        num_generations_per_sample: 1
+      output_path_template: "data/{dataset_name}_en_to_ja.jsonl"
+      system_prompt: ""
+      user_prompt_template: |-
+        あなたは英語レビューを日本語へ翻訳するアシスタントです。与えられた感情ラベルを保ちながら、自然な日本語レビューを1件出力してください。レビュー以外の説明は不要です。
+
+        英語レビュー:
+        {input_text}
+
+        感情ラベル:
+        {label_name}
+
+        出力:
