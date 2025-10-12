@@ -1,0 +1,117 @@
+geval:
+  # === 入力データ設定 ===
+  dataset:
+    # 評価対象となる合成データのパス（複数指定可）
+    input_paths:
+      - "data/marc_ja_augmented_zero_shot_run1.jsonl"
+      - "data/marc_ja_augmented_few_shot_run1.jsonl"
+    # 各レコードの本文が入っている列名
+    text_column: "sentence"
+    # 元ラベルIDを保持している列名（存在しない場合は省略可）
+    label_column: "label"
+    # ラベルID→ラベル名の対応表（評価プロンプトでラベル名を参照する際に利用）
+    label_names:
+      - positive
+      - negative
+
+  # === 評価モデル設定 ===
+  model:
+    # G-Evalで利用する採点モデルの種別（augment.pyと同じくhuggingface/unsloth等を指定可能）
+    provider: "huggingface"
+    # ロードする基盤モデル名（HF HubのモデルID）
+    name: "google/gemma-3-4b-it"
+    max_seq_length: 4096
+    device_map: "auto"
+    # 半精度推論に使うdtype（GPUがBF16対応していない場合はfloat16等に変更）
+    torch_dtype: bfloat16
+    tokenizer:
+      # FastTokenizerを使うかどうか
+      use_fast: true
+
+  # === スコアリング(選択肢・デフォルト閾値) ===
+  scoring:
+    # 指定が無いプロンプト向けのデフォルト閾値。filter.min_score と重複している場合はfilter側が優先。
+    min_score: 3.5
+    # スコア候補（回答トークン）ごとの数値と文字列表現を定義。モデルが出力しやすい表記を追加すると安定。
+    choices:
+      - value: 1
+        variants: ["1", " 1"]
+      - value: 2
+        variants: ["2", " 2"]
+      - value: 3
+        variants: ["3", " 3"]
+      - value: 4
+        variants: ["4", " 4"]
+      - value: 5
+        variants: ["5", " 5"]
+
+  # === 出力ファイルパス ===
+  output:
+    # スコア付与結果（全プロンプト分をまとめたレコード）を書き出すテンプレート
+    dataset_scores_path_template: "data/geval/{dataset_name}_scores.jsonl"
+    # プロンプトごとにレコードを書き出すテンプレート（{prompt_name} が利用可能）
+    prompt_scores_path_template: "data/geval/{dataset_name}_{prompt_name}_scores.jsonl"
+
+  # === 観点ごとの評価プロンプト ===
+  prompts:
+    alignment:
+      description: "感情一致の観点から生成レビューを評価"
+      system_prompt: ""
+      user_prompt_template: |-
+        あなたはレビュー評価者です。以下の生成レビューが指定された感情ラベル「{label_name}」にどれだけ一致しているかを5段階で評価してください。
+        1は全く一致しない、5は完全に一致することを意味します。
+        まず内省的に理由を段階的に考えてから、最終的な結論のみを出力してください（思考の内容は出力しないこと）。
+        必ず1から5の整数のみで回答してください。
+
+        生成レビュー:
+        {generated_text}
+
+        評価フォーム（数字のみ）:
+        スコア:
+    fluency:
+      description: "自然さ・流暢さの観点から生成レビューを評価"
+      system_prompt: ""
+      template_variables:
+        reference_text: "reference_text"
+      user_prompt_template: |-
+        あなたは文章校正の専門家です。以下の生成レビューの自然さと読みやすさを評価し、1(不自然)〜5(非常に自然)の整数スコアのみを出力してください。
+        比較のための元レビューが存在する場合は参考にしつつ、生成文単体の品質を評価してください。
+        まず内省的に理由を段階的に考えてから、最終的な結論のみを出力してください（思考の内容は出力しないこと）。
+        必ず1から5の整数のみで回答してください。
+
+        元レビュー:
+        {reference_text}
+
+        生成レビュー:
+        {generated_text}
+
+        評価フォーム（数字のみ）:
+        スコア:
+    consistency:
+      description: "内容の論理的一貫性・主張の安定性の観点から生成レビューを評価"
+      system_prompt: ""
+      user_prompt_template: |-
+        あなたは論理検証の専門家です。以下の生成レビューについて、主張と理由が矛盾せず、一貫した感情・論旨で書かれているかを評価してください。
+        1は矛盾や飛躍が多く一貫性が低い、5は矛盾がなく論理の流れが明確で一貫性が高いことを意味します。
+        まず内省的に理由を段階的に考えてから、最終的な結論のみを出力してください（思考の内容は出力しないこと）。
+        必ず1から5の整数のみで回答してください。
+
+        生成レビュー:
+        {generated_text}
+
+        評価フォーム（数字のみ）:
+        スコア:
+    evidence_diversity:
+      description: "判断根拠の多様性（複数の観点・具体例の有無）の観点から生成レビューを評価"
+      system_prompt: ""
+      user_prompt_template: |-
+        あなたはレビュー分析の専門家です。以下の生成レビューが、評価の根拠を複数提示しているか（例：製品の複数側面、具体的事例、比較、使用状況など）を評価してください。
+        1は根拠が曖昧・単一で具体性が低い、5は複数の独立した根拠が明確かつ具体的に示されていることを意味します。
+        まず内省的に理由を段階的に考えてから、最終的な結論のみを出力してください（思考の内容は出力しないこと）。
+        必ず1から5の整数のみで回答してください。
+
+        生成レビュー:
+        {generated_text}
+
+        評価フォーム（数字のみ）:
+        スコア:
