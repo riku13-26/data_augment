@@ -1,4 +1,4 @@
-﻿# MARC-ja データ生成 & 学習パイプライン
+# MARC-ja データ生成 & 学習パイプライン
 
 このプロジェクトでは、MARC-ja（日本語レビュー分類）データセットを対象に
 
@@ -29,7 +29,7 @@ python -m pip install -r requirements.txt
 `MARC-ja/make_sampling_data.py` は JGLUE/MARC-ja の学習データから一部をサンプリングし、JSONL として保存します。設定値は `MARC-ja/config.yaml` の `data.train_subset_*` にも記載されています。
 
 ```powershell
-(.venv) PS C:\Users\rikut\OneDrive\ドキュメント\Research\sentiment_analysis>
+(.venv) PS path\to\sentiment_analysis>
 python MARC-ja\make_sampling_data.py `
     --config MARC-ja\config.yaml `
     --ratio 0.10 `
@@ -38,7 +38,7 @@ python MARC-ja\make_sampling_data.py `
     --overwrite
 ```
 
-- `--ratio` で元データから取り出す割合（0〜1]）を指定します。
+- `--ratio` で元データから取り出す割合（0〜1）を指定します。
 - 生成したファイルを学習で使うには、`MARC-ja/config.yaml` の `data.train_subset_enabled` を `true` に更新してください。
 
 ---
@@ -48,7 +48,7 @@ python MARC-ja\make_sampling_data.py `
 `MARC-ja/augment.py` は `MARC-ja/augmentation.yaml` の設定を読み込み、指定した LLM でレビューを生成します。生成した JSONL は `data/` 配下に保存されます。
 
 ```powershell
-(.venv) PS C:\Users\rikut\OneDrive\ドキュメント\Research\sentiment_analysis>
+(.venv) PS path\to\sentiment_analysis>
 python MARC-ja\augment.py `
     --config MARC-ja\augmentation.yaml `
     --prompt zero_shot
@@ -57,6 +57,26 @@ python MARC-ja\augment.py `
 - `--prompt` を複数回指定すると対象プロンプトを絞り込めます（例: `--prompt zero_shot --prompt ja_to_en_translation`）。
 - 出力先は `augmentation.yaml` の `output_path_template` / `output_path` に従います。
 - Hugging Face モデルで量子化を使う際は、`augmentation.yaml` のコメントを参考に GPU が対応している dtype を選択してください。
+
+---
+
+## 2.5 G-Eval による合成データのスコアリング
+
+`MARC-ja/g_eval.py` と `MARC-ja/geval.yaml` を利用すると、生成データに対して複数観点の G-Eval スコアリングを実行し、結果を JSONL で保存できます。`augmentation.py` が出力した JSONL を `dataset.input_paths` に指定すると、評価済みレコードが `data/geval/` 配下へ出力されます。
+
+```powershell
+(.venv) PS path\to\sentiment_analysis>
+python MARC-ja\g_eval.py `
+    --config MARC-ja\geval.yaml `
+    --prompt alignment `
+    --prompt fluency
+```
+
+- `--prompt` を省略すると `geval.yaml` で定義されたすべての観点を評価します。必要な観点だけ実行したい場合は上記のように明示指定してください。
+- `geval.output.dataset_scores_path_template` で「1レコードに対する全観点スコア」をまとめたファイルを制御し、`geval.output.prompt_scores_path_template` で「観点ごとのスコアのみ」を書き出すファイル名を制御します。
+- スコアは 1〜5 のトークン候補の対数確率を重み付き平均して算出しています。トークナイズが難しい場合は `scoring.choices` で追加バリアントを指定してください。
+
+出力された JSONL を `config.yaml` の `data.augmented_mix.augmented_paths` に追加すれば、評価情報付きの合成データを学習に取り込めます。観点やテンプレートはユースケースに応じて調整してください。
 
 ---
 
@@ -73,7 +93,7 @@ python MARC-ja\augment.py `
 実行例:
 
 ```powershell
-(.venv) PS C:\Users\rikut\OneDrive\ドキュメント\Research\sentiment_analysis>
+(.venv) PS path\to\sentiment_analysis>
 python MARC-ja\train.py --config MARC-ja\config.yaml
 ```
 
