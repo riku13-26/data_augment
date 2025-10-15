@@ -2,10 +2,11 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 # 合成データをG-Eval手法で多観点スコアリングするスクリプト
 
@@ -92,6 +93,48 @@ def normalize_score_choices(scoring_cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def initialize_wandb_run(eval_cfg: Dict[str, Any], config_path: Path) -> Any | None:
+    """W&BのRunを初期化する。無効時はNoneを返す。"""
+    wandb_cfg = eval_cfg.get("wandb") or {}
+    if wandb_cfg.get("enabled", True) is False:
+        return None
+
+    try:
+        import wandb  # type: ignore
+    except ImportError as err:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "wandb logging is enabled but the wandb package is not installed. "
+            "Install it with `pip install wandb` or disable logging via geval.wandb.enabled=false."
+        ) from err
+
+    init_kwargs: Dict[str, Any] = {
+        "project": wandb_cfg.get("project") or "geval",
+        "config": eval_cfg,
+    }
+
+    entity = wandb_cfg.get("entity")
+    if entity:
+        init_kwargs["entity"] = entity
+
+    run_name = wandb_cfg.get("run_name") or f"geval-{config_path.stem}"
+    if run_name:
+        init_kwargs["name"] = run_name
+
+    tags = wandb_cfg.get("tags")
+    if tags:
+        init_kwargs["tags"] = list(tags)
+
+    mode = wandb_cfg.get("mode")
+    if mode:
+        init_kwargs["mode"] = mode
+
+    dir_path = wandb_cfg.get("dir")
+    if dir_path:
+        init_kwargs["dir"] = dir_path
+
+    return wandb.init(**init_kwargs)
+
+
 def encode_variant(tokenizer: Any, text: str) -> List[int]:
     """各スコア候補のトークン列をTokenizerで符号化する。"""
     attempts = [text]
@@ -115,37 +158,6 @@ def encode_variant(tokenizer: Any, text: str) -> List[int]:
     raise ValueError(f"Tokenizer could not encode variant '{text}'.")
 
 
-def compute_variant_logprob(
-    model: Any,
-    base_input_ids: torch.Tensor,
-    base_attention_mask: torch.Tensor | None,
-    variant_ids: List[int],
-) -> float:
-    """ベースプロンプトに続くスコア候補トークン列の対数確率を求める。"""
-    device = base_input_ids.device
-    variant_tensor = torch.tensor([variant_ids], dtype=base_input_ids.dtype, device=device)
-    full_input_ids = torch.cat([base_input_ids, variant_tensor], dim=1)
-
-    attention_mask = None
-    if base_attention_mask is not None:
-        variant_mask = torch.ones_like(variant_tensor, device=device)
-        attention_mask = torch.cat([base_attention_mask, variant_mask], dim=1)
-
-    with torch.no_grad():
-        outputs = model(input_ids=full_input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-
-    log_probs = torch.log_softmax(logits, dim=-1)
-    prompt_len = base_input_ids.shape[1]
-
-    total_log_prob = 0.0
-    for idx, token_id in enumerate(variant_ids):
-        position = prompt_len - 1 + idx
-        total_log_prob += float(log_probs[0, position, token_id])
-
-    return total_log_prob
-
-
 def compute_prompt_score(
     model: Any,
     tokenizer: Any,
@@ -157,6 +169,7 @@ def compute_prompt_score(
     prompt_inputs = tokenizer(
         prompt_text,
         return_tensors="pt",
+        add_special_tokens=False,
     )
     prompt_inputs = {k: v.to(model_device) for k, v in prompt_inputs.items()}
 
@@ -167,38 +180,113 @@ def compute_prompt_score(
     store_variant_details = scoring_settings["store_variant_details"]
     store_value_log_probs = scoring_settings["store_value_log_probs"]
 
+    if base_input_ids.shape[0] != 1:
+        raise ValueError("compute_prompt_score expects a single prompt example per batch.")
+
+    base_prompt_ids = base_input_ids[0]
+    base_prompt_len = base_prompt_ids.shape[0]
+
+    if base_attention_mask is not None:
+        base_mask = base_attention_mask[0]
+        if base_mask.dtype != torch.long:
+            base_mask = base_mask.to(dtype=torch.long)
+    else:
+        base_mask = torch.ones(base_prompt_len, dtype=torch.long, device=model_device)
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    if pad_token_id is None:
+        raise ValueError("Tokenizer requires pad_token_id or eos_token_id to batch variants.")
+
+    variant_records: List[Dict[str, Any]] = []
+    for choice_index, choice in enumerate(choices):
+        value = float(choice["value"])
+        for variant_text in choice["variants"]:
+            variant_ids = encode_variant(tokenizer, variant_text)
+            variant_records.append(
+                {
+                    "choice_index": choice_index,
+                    "value": value,
+                    "variant_text": variant_text,
+                    "token_ids": variant_ids,
+                }
+            )
+
+    if not variant_records:
+        raise ValueError("No scoring variants were provided.")
+
+    full_input_sequences: List[torch.Tensor] = []
+    full_attention_sequences: List[torch.Tensor] = []
+    for record in variant_records:
+        variant_tensor = torch.tensor(record["token_ids"], dtype=base_prompt_ids.dtype, device=model_device)
+        record["tensor"] = variant_tensor
+        record["length"] = variant_tensor.numel()
+
+        full_input_sequences.append(torch.cat([base_prompt_ids, variant_tensor], dim=0))
+
+        variant_mask = torch.ones(record["length"], dtype=base_mask.dtype, device=model_device)
+        full_attention_sequences.append(torch.cat([base_mask, variant_mask], dim=0))
+
+    batched_input_ids = pad_sequence(
+        full_input_sequences,
+        batch_first=True,
+        padding_value=int(pad_token_id),
+    )
+    batched_attention_mask = pad_sequence(
+        full_attention_sequences,
+        batch_first=True,
+        padding_value=0,
+    )
+
+    with torch.no_grad():
+        outputs = model(input_ids=batched_input_ids, attention_mask=batched_attention_mask)
+        logits = outputs.logits
+
+    log_probs = torch.log_softmax(logits, dim=-1)
+
+    choice_variant_log_probs: List[List[float]] = [[] for _ in choices]
+    variant_details_bucket: List[List[Dict[str, Any]]] | None = None
+    if store_variant_details:
+        variant_details_bucket = [[] for _ in choices]
+
+    for batch_index, record in enumerate(variant_records):
+        length = record["length"]
+        if length == 0:
+            continue
+
+        positions = torch.arange(length, device=model_device, dtype=torch.long) + (base_prompt_len - 1)
+        token_ids_tensor = record["tensor"]
+        token_log_probs = log_probs[batch_index, positions, token_ids_tensor]
+        total_log_prob = float(token_log_probs.sum().item())
+
+        choice_idx = record["choice_index"]
+        choice_variant_log_probs[choice_idx].append(total_log_prob)
+
+        if variant_details_bucket is not None:
+            variant_details_bucket[choice_idx].append(
+                {
+                    "text": record["variant_text"],
+                    "log_prob": total_log_prob,
+                }
+            )
+
     value_log_probs: List[float] = []
     variant_details: List[Dict[str, Any]] = []
 
-    for choice in choices:
-        value = float(choice["value"])
-        variant_log_probs: List[float] = []
-        variant_entries: List[Dict[str, Any]] = []
+    for choice_index, (choice, per_variant_logs) in enumerate(zip(choices, choice_variant_log_probs)):
+        if not per_variant_logs:
+            raise ValueError(f"No valid tokenization variants found for value {choice['value']}.")
 
-        for variant_text in choice["variants"]:
-            variant_ids = encode_variant(tokenizer, variant_text)
-            log_prob = compute_variant_logprob(model, base_input_ids, base_attention_mask, variant_ids)
-            variant_log_probs.append(log_prob)
-            if store_variant_details:
-                variant_entries.append(
-                    {
-                        "text": variant_text,
-                        "log_prob": float(log_prob),
-                    }
-                )
-
-        if not variant_log_probs:
-            raise ValueError(f"No valid tokenization variants found for value {value}.")
-
-        value_log_prob_tensor = torch.tensor(variant_log_probs, dtype=torch.float32)
-        combined_log_prob = float(torch.logsumexp(value_log_prob_tensor, dim=0))
+        log_prob_tensor = torch.tensor(per_variant_logs, dtype=torch.float32, device=model_device)
+        combined_log_prob = float(torch.logsumexp(log_prob_tensor, dim=0).item())
         value_log_probs.append(combined_log_prob)
 
-        if store_variant_details:
+        if variant_details_bucket is not None:
             variant_details.append(
                 {
-                    "value": value,
-                    "variants": variant_entries,
+                    "value": float(choice["value"]),
+                    "variants": variant_details_bucket[choice_index],
                 }
             )
 
@@ -405,6 +493,8 @@ def evaluate_dataset_group(
     scoring_settings: Dict[str, Any],
     output_cfg: Dict[str, Any],
     model_cache: Dict[str, Dict[str, Any]],
+    wandb_run: Any | None = None,
+    wandb_state: Dict[str, Any] | None = None,
 ) -> None:
     dataset = group_payload["dataset"]
     dataset_cfg = group_payload["dataset_cfg"]
@@ -414,9 +504,17 @@ def evaluate_dataset_group(
 
     scored_records: List[Dict[str, Any]] = []
     per_prompt_records: Dict[str, List[Dict[str, Any]]] = {}
+    prompt_score_sums: Dict[str, float] = {}
+    prompt_score_counts: Dict[str, int] = {}
 
     progress_desc = f"G-Eval ({dataset_name})"
     iterable: Iterable[Dict[str, Any]] = dataset
+    dataset_size = len(dataset)
+    wandb_enabled = wandb_run is not None
+    if wandb_enabled and wandb_state is None:
+        wandb_state = {"step": 0}
+    if wandb_state is not None:
+        wandb_state["step"] = int(wandb_state.get("step", 0))
 
     for example in tqdm(iterable, desc=progress_desc, total=len(dataset)):
         example_dict = {key: example[key] for key in example.keys()}
@@ -460,6 +558,8 @@ def evaluate_dataset_group(
 
             per_prompt_results[prompt_name] = prompt_result
             prompt_scores.append(prompt_result["score"])
+            prompt_score_sums[prompt_name] = prompt_score_sums.get(prompt_name, 0.0) + float(prompt_result["score"])
+            prompt_score_counts[prompt_name] = prompt_score_counts.get(prompt_name, 0) + 1
 
             prompt_specific_record = dict(example_dict)
             prompt_specific_record["geval"] = {
@@ -482,6 +582,23 @@ def evaluate_dataset_group(
         aggregate_info = {
             "score": aggregate_score,
         }
+
+        if wandb_enabled and wandb_state is not None:
+            example_index = len(scored_records) + 1
+            progress_ratio = float(example_index / dataset_size) if dataset_size else 0.0
+            step_value = int(wandb_state["step"])
+            log_payload: Dict[str, Any] = {
+                "dataset/name": dataset_name,
+                "dataset/index": dataset_index,
+                "dataset/example_index": example_index,
+                "dataset/progress": progress_ratio,
+            }
+            if aggregate_score is not None:
+                log_payload["geval/aggregate_score"] = float(aggregate_score)
+            for prompt_name, prompt_result in per_prompt_results.items():
+                log_payload[f"geval/prompts/{prompt_name}/score"] = float(prompt_result["score"])
+            wandb_run.log(log_payload, step=step_value)
+            wandb_state["step"] = step_value + 1
 
         scored_record = dict(example_dict)
         scored_record["geval"] = {
@@ -514,6 +631,30 @@ def evaluate_dataset_group(
                     for record in prompt_records:
                         f.write(dumps_json(record) + "\n")
 
+    if wandb_enabled and wandb_state is not None:
+        summary_payload: Dict[str, Any] = {
+            "dataset/name": dataset_name,
+            "dataset/index": dataset_index,
+            "dataset/examples": len(scored_records),
+        }
+        aggregate_scores = [
+            record["geval"]["aggregate"]["score"]
+            for record in scored_records
+            if record["geval"]["aggregate"]["score"] is not None
+        ]
+        if aggregate_scores:
+            summary_payload["geval/dataset_mean_score"] = float(np.mean(aggregate_scores))
+            summary_payload["geval/dataset_std_score"] = float(np.std(aggregate_scores))
+            summary_payload["geval/dataset_min_score"] = float(min(aggregate_scores))
+            summary_payload["geval/dataset_max_score"] = float(max(aggregate_scores))
+        for prompt_name, total in prompt_score_sums.items():
+            count = prompt_score_counts.get(prompt_name, 0)
+            if count:
+                summary_payload[f"geval/prompts/{prompt_name}/mean_score"] = float(total / count)
+        step_value = int(wandb_state["step"])
+        wandb_run.log(summary_payload, step=step_value)
+        wandb_state["step"] = step_value + 1
+
 
 def main(
     config_path: str = "geval.yaml",
@@ -522,7 +663,8 @@ def main(
     list_prompts: bool = False,
 ) -> None:
     """G-Eval全体のエントリポイント。設定読込・データグループ作成・評価実行を担う。"""
-    config = load_config(Path(config_path))
+    config_path_obj = Path(config_path)
+    config = load_config(config_path_obj)
     eval_cfg = config.get("geval") or {}
 
     dataset_cfg = eval_cfg.get("dataset") or {}
@@ -598,17 +740,26 @@ def main(
         print("[Warning] No datasets matched the selected prompts.")
         return
 
+    wandb_run = initialize_wandb_run(eval_cfg, config_path_obj)
+    wandb_state: Dict[str, Any] | None = {"step": 0} if wandb_run is not None else None
+
     model_cache: Dict[str, Dict[str, Any]] = {}
 
-    for key, payload in dataset_groups.items():
-        evaluate_dataset_group(
-            key,
-            payload,
-            model_cfg=model_cfg,
-            scoring_settings=scoring_settings,
-            output_cfg=output_cfg,
-            model_cache=model_cache,
-        )
+    try:
+        for key, payload in dataset_groups.items():
+            evaluate_dataset_group(
+                key,
+                payload,
+                model_cfg=model_cfg,
+                scoring_settings=scoring_settings,
+                output_cfg=output_cfg,
+                model_cache=model_cache,
+                wandb_run=wandb_run,
+                wandb_state=wandb_state,
+            )
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 if __name__ == "__main__":
