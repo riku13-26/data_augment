@@ -39,15 +39,15 @@ geval:
     # スコア候補（回答トークン）ごとの数値と文字列表現を定義。モデルが出力しやすい表記を追加すると安定。
     choices:
       - value: 1
-        variants: ["1"]
+        variants: ["1", " 1"]
       - value: 2
-        variants: ["2"]
+        variants: ["2", " 2"]
       - value: 3
-        variants: ["3"]
+        variants: ["3", " 3"]
       - value: 4
-        variants: ["4"]
+        variants: ["4", " 4"]
       - value: 5
-        variants: ["5"]
+        variants: ["5", " 5"]
 
   # === 出力ファイルパス ===
   output:
