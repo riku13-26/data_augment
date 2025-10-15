@@ -1,0 +1,93 @@
+geval:
+  # === 入力データ設定 ===
+  dataset:
+    input_paths:
+      - "data/marc_ja_augmented_zero_shot_run1.jsonl"
+      - "data/marc_ja_augmented_few_shot_run1.jsonl"
+    text_column: "sentence"
+    label_column: "label"
+    label_names:
+      - positive
+      - negative
+
+  # === 評価モデル設定 (vLLM) ===
+  model:
+    provider: "vllm"
+    name: "ISTA-DASLab/gemma-3-4b-it-GPTQ-4b-128g"
+    max_model_len: 4096
+    tensor_parallel_size: 1
+    dtype: "bfloat16"
+    gpu_memory_utilization: 0.9
+    tokenizer:
+      name: "ISTA-DASLab/gemma-3-4b-it-GPTQ-4b-128g"
+
+  # === スコアリング ===
+  scoring:
+    min_score: 3.5
+    choices:
+      - value: 1
+        variants: ["1", " 1"]
+      - value: 2
+        variants: ["2", " 2"]
+      - value: 3
+        variants: ["3", " 3"]
+      - value: 4
+        variants: ["4", " 4"]
+      - value: 5
+        variants: ["5", " 5"]
+
+  # === 出力ファイルパス ===
+  output:
+    dataset_scores_path_template: "data/geval_vllm/{dataset_name}_scores.jsonl"
+    prompt_scores_path_template: "data/geval_vllm/{dataset_name}_{prompt_name}_scores.jsonl"
+
+  # === 観点ごとの評価プロンプト ===
+  prompts:
+    alignment:
+      description: "感情一致の観点から生成レビューを評価"
+      system_prompt: ""
+      user_prompt_template: |-
+        あなたはレビュー評価者です。以下の生成レビューが指定された感情ラベル「{label_name}」にどれだけ一致しているかを5段階で評価してください。
+        1は全く一致していない、5は完全に一致することを意味します。
+        生成レビュー:
+        {generated_text}
+
+        評価フォームは数字のみです。
+        スコア:
+    fluency:
+      description: "自然さと流暢さの観点から生成レビューを評価"
+      system_prompt: ""
+      template_variables:
+        reference_text: "reference_text"
+      user_prompt_template: |-
+        あなたは文章校正の専門家です。以下の生成レビューの自然さと読みやすさを評価し、1(不自然)〜5(非常に自然)の整数スコアのみを出力してください。
+
+        参考レビュー:
+        {reference_text}
+
+        生成レビュー:
+        {generated_text}
+
+        スコア:
+    consistency:
+      description: "論理的一貫性の観点から生成レビューを評価"
+      system_prompt: ""
+      user_prompt_template: |-
+        あなたは論理検証の専門家です。以下の生成レビューについて、主張と根拠が矛盾せず一貫性が保たれているかを評価してください。
+        1は矛盾が多く一貫性が低い、5は矛盾がなく論理の流れが明確であることを意味します。
+
+        生成レビュー:
+        {generated_text}
+
+        スコア:
+    evidence_diversity:
+      description: "判断根拠の多様性の観点から生成レビューを評価"
+      system_prompt: ""
+      user_prompt_template: |-
+        あなたはレビュー分析の専門家です。以下の生成レビューが評価の根拠を複数提示しているか(例: 製品の複数側面、具体的な事例など)を審査してください。
+        1は根拠が曖昧・単一である、5は複数の独立した根拠が明確に示されていることを意味します。
+
+        生成レビュー:
+        {generated_text}
+
+        スコア:
